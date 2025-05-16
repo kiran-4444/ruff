@@ -1086,9 +1086,32 @@ impl<'db> CallableBinding<'db> {
             return;
         }
 
-        let callable_description = CallableDescription::new(context.db(), self.callable_type);
-        if self.overloads.len() > 1 {
-            if let Some(builder) = context.report_lint(&NO_MATCHING_OVERLOAD, node) {
+        match self.overloads.as_slice() {
+            [] => {}
+            [overload] => {
+                let callable_description =
+                    CallableDescription::new(context.db(), self.signature_type);
+                overload.report_diagnostics(
+                    context,
+                    node,
+                    self.signature_type,
+                    callable_description.as_ref(),
+                    union_diag,
+                );
+            }
+            _overloads => {
+                // When the number of unmatched overloads exceeds this number, we stop
+                // printing them to avoid excessive output.
+                //
+                // An example of a routine with many many overloads:
+                // https://github.com/henribru/google-api-python-client-stubs/blob/master/googleapiclient-stubs/discovery.pyi
+                const MAXIMUM_OVERLOADS: usize = 50;
+
+                let Some(builder) = context.report_lint(&NO_MATCHING_OVERLOAD, node) else {
+                    return;
+                };
+                let callable_description =
+                    CallableDescription::new(context.db(), self.callable_type);
                 let mut diag = builder.into_diagnostic(format_args!(
                     "No overload{} matches arguments",
                     if let Some(CallableDescription { kind, name }) = callable_description {
@@ -1097,22 +1120,64 @@ impl<'db> CallableBinding<'db> {
                         String::new()
                     }
                 ));
+                // TODO: This should probably be adapted to handle more
+                // types of callables[1]. At present, it just handles
+                // standard function and method calls.
+                //
+                // [1]: https://github.com/astral-sh/ty/issues/274#issuecomment-2881856028
+                let function_type_and_kind = match self.signature_type {
+                    Type::FunctionLiteral(function) => Some(("function", function)),
+                    Type::BoundMethod(bound_method) => {
+                        Some(("bound method", bound_method.function(context.db())))
+                    }
+                    _ => None,
+                };
+                if let Some((kind, function)) = function_type_and_kind {
+                    if let Some(overloaded_function) = function.to_overloaded(context.db()) {
+                        if let Some(spans) = overloaded_function
+                            .overloads
+                            .first()
+                            .and_then(|overload| overload.spans(context.db()))
+                        {
+                            let mut sub =
+                                SubDiagnostic::new(Severity::Info, "First overload defined here");
+                            sub.annotate(Annotation::primary(spans.signature));
+                            diag.sub(sub);
+                        }
+
+                        diag.info(format_args!(
+                            "Possible overloads for {kind} `{}`:",
+                            function.name(context.db())
+                        ));
+
+                        let overloads = &function.signature(context.db()).overloads.overloads;
+                        for overload in overloads.iter().take(MAXIMUM_OVERLOADS) {
+                            diag.info(format_args!("  {}", overload.display(context.db())));
+                        }
+                        if overloads.len() > MAXIMUM_OVERLOADS {
+                            diag.info(format_args!(
+                                "... omitted {remaining} overloads",
+                                remaining = overloads.len() - MAXIMUM_OVERLOADS
+                            ));
+                        }
+
+                        if let Some(spans) = overloaded_function
+                            .implementation
+                            .and_then(|function| function.spans(context.db()))
+                        {
+                            let mut sub = SubDiagnostic::new(
+                                Severity::Info,
+                                "Overload implementation defined here",
+                            );
+                            sub.annotate(Annotation::primary(spans.signature));
+                            diag.sub(sub);
+                        }
+                    }
+                }
                 if let Some(union_diag) = union_diag {
                     union_diag.add_union_context(context.db(), &mut diag);
                 }
             }
-            return;
-        }
-
-        let callable_description = CallableDescription::new(context.db(), self.signature_type);
-        for overload in &self.overloads {
-            overload.report_diagnostics(
-                context,
-                node,
-                self.signature_type,
-                callable_description.as_ref(),
-                union_diag,
-            );
         }
     }
 }
@@ -1232,14 +1297,8 @@ impl<'db> Binding<'db> {
                     first_excess_argument_index,
                     num_synthetic_args,
                 ),
-                expected_positional_count: parameters
-                    .positional()
-                    .count()
-                    // using saturating_sub to avoid negative values due to invalid syntax in source code
-                    .saturating_sub(num_synthetic_args),
-                provided_positional_count: next_positional
-                    // using saturating_sub to avoid negative values due to invalid syntax in source code
-                    .saturating_sub(num_synthetic_args),
+                expected_positional_count: parameters.positional().count(),
+                provided_positional_count: next_positional,
             });
         }
         let mut missing = vec![];

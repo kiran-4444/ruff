@@ -657,25 +657,26 @@ impl<'db> Type<'db> {
         }
     }
 
-    pub fn contains_todo(&self, db: &'db dyn Db) -> bool {
-        match self {
-            Self::Dynamic(DynamicType::Todo(_) | DynamicType::TodoPEP695ParamSpec) => true,
+    /// Return `true` if `self`, or any of the types contained in `self`, match the closure passed in.
+    pub fn any_over_type(self, db: &'db dyn Db, type_fn: &dyn Fn(Type<'db>) -> bool) -> bool {
+        if type_fn(self) {
+            return true;
+        }
 
+        match self {
             Self::AlwaysFalsy
             | Self::AlwaysTruthy
             | Self::Never
             | Self::BooleanLiteral(_)
             | Self::BytesLiteral(_)
-            | Self::FunctionLiteral(_)
-            | Self::NominalInstance(_)
             | Self::ModuleLiteral(_)
+            | Self::FunctionLiteral(_)
             | Self::ClassLiteral(_)
             | Self::KnownInstance(_)
-            | Self::PropertyInstance(_)
             | Self::StringLiteral(_)
             | Self::IntLiteral(_)
             | Self::LiteralString
-            | Self::Dynamic(DynamicType::Unknown | DynamicType::Any)
+            | Self::Dynamic(_)
             | Self::BoundMethod(_)
             | Self::WrapperDescriptor(_)
             | Self::MethodWrapper(_)
@@ -686,7 +687,8 @@ impl<'db> Type<'db> {
                 .specialization(db)
                 .types(db)
                 .iter()
-                .any(|ty| ty.contains_todo(db)),
+                .copied()
+                .any(|ty| ty.any_over_type(db, type_fn)),
 
             Self::Callable(callable) => {
                 let signatures = callable.signatures(db);
@@ -694,54 +696,73 @@ impl<'db> Type<'db> {
                     signature.parameters().iter().any(|param| {
                         param
                             .annotated_type()
-                            .is_some_and(|ty| ty.contains_todo(db))
-                    }) || signature.return_ty.is_some_and(|ty| ty.contains_todo(db))
+                            .is_some_and(|ty| ty.any_over_type(db, type_fn))
+                    }) || signature
+                        .return_ty
+                        .is_some_and(|ty| ty.any_over_type(db, type_fn))
                 })
             }
 
-            Self::SubclassOf(subclass_of) => match subclass_of.subclass_of() {
-                SubclassOfInner::Dynamic(
-                    DynamicType::Todo(_) | DynamicType::TodoPEP695ParamSpec,
-                ) => true,
-                SubclassOfInner::Dynamic(DynamicType::Unknown | DynamicType::Any) => false,
-                SubclassOfInner::Class(_) => false,
-            },
+            Self::SubclassOf(subclass_of) => {
+                Type::from(subclass_of.subclass_of()).any_over_type(db, type_fn)
+            }
 
             Self::TypeVar(typevar) => match typevar.bound_or_constraints(db) {
                 None => false,
-                Some(TypeVarBoundOrConstraints::UpperBound(bound)) => bound.contains_todo(db),
+                Some(TypeVarBoundOrConstraints::UpperBound(bound)) => {
+                    bound.any_over_type(db, type_fn)
+                }
                 Some(TypeVarBoundOrConstraints::Constraints(constraints)) => constraints
                     .elements(db)
                     .iter()
-                    .any(|constraint| constraint.contains_todo(db)),
+                    .any(|constraint| constraint.any_over_type(db, type_fn)),
             },
 
             Self::BoundSuper(bound_super) => {
-                matches!(
-                    bound_super.pivot_class(db),
-                    ClassBase::Dynamic(DynamicType::Todo(_))
-                ) || matches!(
-                    bound_super.owner(db),
-                    SuperOwnerKind::Dynamic(DynamicType::Todo(_))
-                )
+                Type::from(bound_super.pivot_class(db)).any_over_type(db, type_fn)
+                    || Type::from(bound_super.owner(db)).any_over_type(db, type_fn)
             }
 
-            Self::Tuple(tuple) => tuple.elements(db).iter().any(|ty| ty.contains_todo(db)),
+            Self::Tuple(tuple) => tuple
+                .elements(db)
+                .iter()
+                .any(|ty| ty.any_over_type(db, type_fn)),
 
-            Self::Union(union) => union.elements(db).iter().any(|ty| ty.contains_todo(db)),
+            Self::Union(union) => union
+                .elements(db)
+                .iter()
+                .any(|ty| ty.any_over_type(db, type_fn)),
 
             Self::Intersection(intersection) => {
                 intersection
                     .positive(db)
                     .iter()
-                    .any(|ty| ty.contains_todo(db))
+                    .any(|ty| ty.any_over_type(db, type_fn))
                     || intersection
                         .negative(db)
                         .iter()
-                        .any(|ty| ty.contains_todo(db))
+                        .any(|ty| ty.any_over_type(db, type_fn))
             }
 
-            Self::ProtocolInstance(protocol) => protocol.contains_todo(db),
+            Self::ProtocolInstance(protocol) => protocol.any_over_type(db, type_fn),
+
+            Self::PropertyInstance(property) => {
+                property
+                    .getter(db)
+                    .is_some_and(|ty| ty.any_over_type(db, type_fn))
+                    || property
+                        .setter(db)
+                        .is_some_and(|ty| ty.any_over_type(db, type_fn))
+            }
+
+            Self::NominalInstance(instance) => match instance.class {
+                ClassType::NonGeneric(_) => false,
+                ClassType::Generic(generic) => generic
+                    .specialization(db)
+                    .types(db)
+                    .iter()
+                    .any(|ty| ty.any_over_type(db, type_fn)),
+            },
         }
     }
 
@@ -964,15 +985,15 @@ impl<'db> Type<'db> {
             Type::Tuple(tuple) => Type::Tuple(tuple.normalized(db)),
             Type::Callable(callable) => Type::Callable(callable.normalized(db)),
             Type::ProtocolInstance(protocol) => protocol.normalized(db),
+            Type::NominalInstance(instance) => Type::NominalInstance(instance.normalized(db)),
+            Type::Dynamic(_) => Type::any(),
             Type::LiteralString
-            | Type::NominalInstance(_)
             | Type::PropertyInstance(_)
             | Type::AlwaysFalsy
             | Type::AlwaysTruthy
             | Type::BooleanLiteral(_)
             | Type::BytesLiteral(_)
             | Type::StringLiteral(_)
-            | Type::Dynamic(_)
             | Type::Never
             | Type::FunctionLiteral(_)
             | Type::MethodWrapper(_)
@@ -986,10 +1007,7 @@ impl<'db> Type<'db> {
             | Type::IntLiteral(_)
             | Type::BoundSuper(_)
             | Type::SubclassOf(_) => self,
-            Type::GenericAlias(generic) => {
-                let specialization = generic.specialization(db).normalized(db);
-                Type::GenericAlias(GenericAlias::new(db, generic.origin(db), specialization))
-            }
+            Type::GenericAlias(generic) => Type::GenericAlias(generic.normalized(db)),
             Type::TypeVar(typevar) => match typevar.bound_or_constraints(db) {
                 Some(TypeVarBoundOrConstraints::UpperBound(bound)) => {
                     Type::TypeVar(TypeVarInstance::new(
@@ -1494,6 +1512,15 @@ impl<'db> Type<'db> {
             // materialize to any `type[...]` type.
             (Type::SubclassOf(subclass_of_ty), Type::SubclassOf(_))
                 if subclass_of_ty.is_dynamic() =>
+            {
+                true
+            }
+
+            // Every `type[...]` is assignable to `type`
+            (Type::SubclassOf(_), _)
+                if KnownClass::Type
+                    .to_instance(db)
+                    .is_assignable_to(db, target) =>
             {
                 true
             }
@@ -2938,19 +2965,6 @@ impl<'db> Type<'db> {
                     WrapperDescriptorKind::PropertyDunderSet,
                 ))
                 .into()
-            }
-            Type::ClassLiteral(class)
-                if name == "__dataclass_fields__" && class.dataclass_params(db).is_some() =>
-            {
-                // Make this class look like a subclass of the `DataClassInstance` protocol
-                Symbol::bound(KnownClass::Dict.to_specialized_instance(
-                    db,
-                    [
-                        KnownClass::Str.to_instance(db),
-                        KnownClass::Field.to_specialized_instance(db, [Type::any()]),
-                    ],
-                ))
-                .with_qualifiers(TypeQualifiers::CLASS_VAR)
             }
             Type::BoundMethod(bound_method) => match name_str {
                 "__self__" => Symbol::bound(bound_method.self_instance(db)).into(),
@@ -4516,7 +4530,8 @@ impl<'db> Type<'db> {
                 .member_lookup_with_policy(
                     db,
                     "__init__".into(),
-                    MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK,
+                    MemberLookupPolicy::NO_INSTANCE_FALLBACK
+                        | MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK,
                 )
                 .symbol
                 .is_unbound()
@@ -5352,45 +5367,6 @@ impl<'db> Type<'db> {
     /// Returns a tuple of two spans. The first is
     /// the span for the identifier of the function
     /// definition for `self`. The second is
-    /// the span for the return type in the function
-    /// definition for `self`.
-    ///
-    /// If there are no meaningful spans, then this
-    /// returns `None`. For example, when this type
-    /// isn't callable or if the function has no
-    /// declared return type.
-    ///
-    /// # Performance
-    ///
-    /// Note that this may introduce cross-module
-    /// dependencies. This can have an impact on
-    /// the effectiveness of incremental caching
-    /// and should therefore be used judiciously.
-    ///
-    /// An example of a good use case is to improve
-    /// a diagnostic.
-    fn return_type_span(&self, db: &'db dyn Db) -> Option<(Span, Span)> {
-        match *self {
-            Type::FunctionLiteral(function) => {
-                let function_scope = function.body_scope(db);
-                let span = Span::from(function_scope.file(db));
-                let node = function_scope.node(db);
-                let func_def = node.as_function()?;
-                let return_type_range = func_def.returns.as_ref()?.range();
-                let name_span = span.clone().with_range(func_def.name.range);
-                let return_type_span = span.with_range(return_type_range);
-                Some((name_span, return_type_span))
-            }
-            Type::BoundMethod(bound_method) => {
-                Type::FunctionLiteral(bound_method.function(db)).return_type_span(db)
-            }
-            _ => None,
-        }
-    }
-
-    /// Returns a tuple of two spans. The first is
-    /// the span for the identifier of the function
-    /// definition for `self`. The second is
     /// the span for the parameter in the function
     /// definition for `self`.
     ///
@@ -5417,27 +5393,35 @@ impl<'db> Type<'db> {
         parameter_index: Option<usize>,
     ) -> Option<(Span, Span)> {
         match *self {
-            Type::FunctionLiteral(function) => {
-                let function_scope = function.body_scope(db);
-                let span = Span::from(function_scope.file(db));
-                let node = function_scope.node(db);
-                let func_def = node.as_function()?;
-                let range = parameter_index
-                    .and_then(|parameter_index| {
-                        func_def
-                            .parameters
-                            .iter()
-                            .nth(parameter_index)
-                            .map(|param| param.range())
-                    })
-                    .unwrap_or(func_def.parameters.range);
-                let name_span = span.clone().with_range(func_def.name.range);
-                let parameter_span = span.with_range(range);
-                Some((name_span, parameter_span))
-            }
-            Type::BoundMethod(bound_method) => {
-                Type::FunctionLiteral(bound_method.function(db)).parameter_span(db, parameter_index)
-            }
+            Type::FunctionLiteral(function) => function.parameter_span(db, parameter_index),
+            Type::BoundMethod(bound_method) => bound_method
+                .function(db)
+                .parameter_span(db, parameter_index),
+            _ => None,
+        }
+    }
+
+    /// Returns a collection of useful spans for a
+    /// function signature. These are useful for
+    /// creating annotations on diagnostics.
+    ///
+    /// If there are no meaningful spans, then this
+    /// returns `None`. For example, when this type
+    /// isn't callable.
+    ///
+    /// # Performance
+    ///
+    /// Note that this may introduce cross-module
+    /// dependencies. This can have an impact on
+    /// the effectiveness of incremental caching
+    /// and should therefore be used judiciously.
+    ///
+    /// An example of a good use case is to improve
+    /// a diagnostic.
+    fn function_spans(&self, db: &'db dyn Db) -> Option<FunctionSpans> {
+        match *self {
+            Type::FunctionLiteral(function) => function.spans(db),
+            Type::BoundMethod(bound_method) => bound_method.function(db).spans(db),
             _ => None,
         }
     }
@@ -6322,7 +6306,8 @@ impl<'db> BoolError<'db> {
                     .member(context.db(), "__bool__")
                     .into_lookup_result()
                     .ok()
-                    .and_then(|quals| quals.inner_type().return_type_span(context.db()))
+                    .and_then(|quals| quals.inner_type().function_spans(context.db()))
+                    .and_then(|spans| Some((spans.name, spans.return_type?)))
                 {
                     sub.annotate(
                         Annotation::primary(return_type_span).message("Incorrect return type"),
@@ -6918,6 +6903,101 @@ impl<'db> FunctionType<'db> {
             })
         }
     }
+
+    /// Returns a tuple of two spans. The first is
+    /// the span for the identifier of the function
+    /// definition for `self`. The second is
+    /// the span for the parameter in the function
+    /// definition for `self`.
+    ///
+    /// If there are no meaningful spans, then this
+    /// returns `None`. For example, when this type
+    /// isn't callable.
+    ///
+    /// When `parameter_index` is `None`, then the
+    /// second span returned covers the entire parameter
+    /// list.
+    ///
+    /// # Performance
+    ///
+    /// Note that this may introduce cross-module
+    /// dependencies. This can have an impact on
+    /// the effectiveness of incremental caching
+    /// and should therefore be used judiciously.
+    ///
+    /// An example of a good use case is to improve
+    /// a diagnostic.
+    fn parameter_span(
+        self,
+        db: &'db dyn Db,
+        parameter_index: Option<usize>,
+    ) -> Option<(Span, Span)> {
+        let function_scope = self.body_scope(db);
+        let span = Span::from(function_scope.file(db));
+        let node = function_scope.node(db);
+        let func_def = node.as_function()?;
+        let range = parameter_index
+            .and_then(|parameter_index| {
+                func_def
+                    .parameters
+                    .iter()
+                    .nth(parameter_index)
+                    .map(|param| param.range())
+            })
+            .unwrap_or(func_def.parameters.range);
+        let name_span = span.clone().with_range(func_def.name.range);
+        let parameter_span = span.with_range(range);
+        Some((name_span, parameter_span))
+    }
+
+    /// Returns a collection of useful spans for a
+    /// function signature. These are useful for
+    /// creating annotations on diagnostics.
+    ///
+    /// # Performance
+    ///
+    /// Note that this may introduce cross-module
+    /// dependencies. This can have an impact on
+    /// the effectiveness of incremental caching
+    /// and should therefore be used judiciously.
+    ///
+    /// An example of a good use case is to improve
+    /// a diagnostic.
+    fn spans(self, db: &'db dyn Db) -> Option<FunctionSpans> {
+        let function_scope = self.body_scope(db);
+        let span = Span::from(function_scope.file(db));
+        let node = function_scope.node(db);
+        let func_def = node.as_function()?;
+        let return_type_range = func_def.returns.as_ref().map(|returns| returns.range());
+        let mut signature = func_def.name.range.cover(func_def.parameters.range);
+        if let Some(return_type_range) = return_type_range {
+            signature = signature.cover(return_type_range);
+        }
+        Some(FunctionSpans {
+            signature: span.clone().with_range(signature),
+            name: span.clone().with_range(func_def.name.range),
+            parameters: span.clone().with_range(func_def.parameters.range),
+            return_type: return_type_range.map(|range| span.clone().with_range(range)),
+        })
+    }
+}
+
+/// A collection of useful spans for annotating functions.
+///
+/// This can be retrieved via `FunctionType::spans` or
+/// `Type::function_spans`.
+struct FunctionSpans {
+    /// The span of the entire function "signature." This includes
+    /// the name, parameter list and return type (if present).
+    signature: Span,
+    /// The span of the function name. i.e., `foo` in `def foo(): ...`.
+    name: Span,
+    /// The span of the parameter list, including the opening and
+    /// closing parentheses.
+    #[expect(dead_code)]
+    parameters: Span,
+    /// The span of the annotated return type, if present.
+    return_type: Option<Span>,
 }
 
 fn signature_cycle_recover<'db>(
@@ -8102,6 +8182,16 @@ impl<'db> SuperOwnerKind<'db> {
                 SuperOwnerKind::try_from_type(db, known_instance.instance_fallback(db))
             }
             _ => None,
+        }
+    }
+}
+
+impl<'db> From<SuperOwnerKind<'db>> for Type<'db> {
+    fn from(owner: SuperOwnerKind<'db>) -> Self {
+        match owner {
+            SuperOwnerKind::Dynamic(dynamic) => Type::Dynamic(dynamic),
+            SuperOwnerKind::Class(class) => class.into(),
+            SuperOwnerKind::Instance(instance) => instance.into(),
         }
     }
 }
